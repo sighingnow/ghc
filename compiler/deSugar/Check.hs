@@ -9,7 +9,7 @@ Pattern Matching Coverage Checking.
 
 module Check (
         -- Checking and printing
-        checkSingle, checkMatches, isAnyPmCheckEnabled,
+        checkSingle, checkMatches, checkGuardMatches, isAnyPmCheckEnabled,
 
         -- See Note [Type and Term Equality Propagation]
         genCaseTmCs1, genCaseTmCs2,
@@ -52,7 +52,8 @@ import TyCoRep
 import Type
 import UniqSupply
 import DsGRHSs       (isTrueLHsExpr)
-import Maybes        ( expectJust )
+import DsUtils       (mkLHsVarPatTup)
+import Maybes        (expectJust)
 
 import Data.List     (find)
 import Data.Maybe    (isJust, fromMaybe)
@@ -342,6 +343,24 @@ checkSingle' locn var p = do
     (NotCovered, Diverged )   -> PmResult prov [] us' m  -- inaccessible rhs
   where m = [L locn [L locn p]]
 
+-- | Exhaustive for guard matches, is used for guards in pattern bindings and
+-- in @MultiIf@ expressions.
+checkGuardMatches :: HsMatchContext Name          -- Match context
+                  -> GRHSs GhcTc (LHsExpr GhcTc)  -- Guarded RHSs
+                  -> Type                         -- Type of RHS
+                  -> DsM ()
+checkGuardMatches hs_ctx guards@(GRHSs grhss _) rhs_ty = do
+    dflags <- getDynFlags
+    vanillaId <- mkPmId rhs_ty
+    let vanillaLPat = mkLHsVarPatTup [vanillaId]
+        combinedLoc = foldl1 combineSrcSpans (map getLoc grhss)
+        dsMatchContext = DsMatchContext hs_ctx combinedLoc
+        match = L combinedLoc $
+                  Match { m_ctxt = hs_ctx
+                        , m_pats = [vanillaLPat]
+                        , m_grhss = guards }
+    checkMatches dflags dsMatchContext [vanillaId] [match]
+
 -- | Check a matchgroup (case, functions, etc.)
 checkMatches :: DynFlags -> DsMatchContext
              -> [Id] -> [LMatch GhcTc (LHsExpr GhcTc)] -> DsM ()
@@ -368,7 +387,7 @@ checkMatches' vars matches
   | otherwise = do
       liftD resetPmIterDs -- set the iter-no to zero
       missing    <- mkInitialUncovered vars
-      tracePm "checkMatches: missing" (vcat (map pprValVecDebug missing))
+      tracePm "checkMatches': missing" (vcat (map pprValVecDebug missing))
       (prov, rs,us,ds) <- go matches missing
       return $ PmResult {
                    pmresultProvenance   = prov
@@ -1893,7 +1912,7 @@ exhaustive  dflags = maybe False (`wopt` dflags) . exhaustiveWarningFlag
 exhaustiveWarningFlag :: HsMatchContext id -> Maybe WarningFlag
 exhaustiveWarningFlag (FunRhs {})   = Just Opt_WarnIncompletePatterns
 exhaustiveWarningFlag CaseAlt       = Just Opt_WarnIncompletePatterns
-exhaustiveWarningFlag IfAlt         = Nothing
+exhaustiveWarningFlag IfAlt         = Just Opt_WarnIncompletePatterns
 exhaustiveWarningFlag LambdaExpr    = Just Opt_WarnIncompleteUniPatterns
 exhaustiveWarningFlag PatBindRhs    = Just Opt_WarnIncompleteUniPatterns
 exhaustiveWarningFlag ProcExpr      = Just Opt_WarnIncompleteUniPatterns
@@ -1901,6 +1920,7 @@ exhaustiveWarningFlag RecUpd        = Just Opt_WarnIncompletePatternsRecUpd
 exhaustiveWarningFlag ThPatSplice   = Nothing
 exhaustiveWarningFlag PatSyn        = Nothing
 exhaustiveWarningFlag ThPatQuote    = Nothing
+exhaustiveWarningFlag (StmtCtxt (PatGuard _)) = Just Opt_WarnIncompletePatterns
 exhaustiveWarningFlag (StmtCtxt {}) = Nothing -- Don't warn about incomplete patterns
                                        -- in list comprehensions, pattern guards
                                        -- etc. They are often *supposed* to be
